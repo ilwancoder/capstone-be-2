@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"strings"
+	"time"
 
 	"capstone-be-2/config"
 	"capstone-be-2/controllers/services"
@@ -14,90 +15,97 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
-// RegisterUser handles new user registration
 func RegisterUser(c *fiber.Ctx) error {
-	// ... (logic for parsing body and checking email)
-	var user models.User
-	if err := c.BodyParser(&user); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "Invalid request body"})
-	}
-	user.Email = strings.ToLower(user.Email)
-	collection := config.GetCollection("users")
-	if err := collection.FindOne(context.Background(), bson.M{"email": user.Email}).Decode(&user); err == nil {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"message": "Email already registered"})
-	}
-
-	// Call service to hash password
-	hashedPassword, err := services.HashPassword(user.PasswordHash)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "Could not hash password"})
-	}
-	user.PasswordHash = hashedPassword
-
-	// ... (logic for setting initial values and inserting into DB)
-	user.ID = primitive.NewObjectID()
-	user.Points = 0
-	user.BorrowedBooks = []primitive.ObjectID{}
-
-	_, err = collection.InsertOne(context.Background(), user)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "Could not register user"})
-	}
-
-	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"message": "User registered successfully"})
-}
-
-// LoginUser handles user login and JWT generation
-func LoginUser(c *fiber.Ctx) error {
-	// ... (logic for parsing body and finding user)
-	var credentials struct {
+	var body struct {
+		Name     string `json:"name"`
 		Email    string `json:"email"`
 		Password string `json:"password"`
 	}
-	if err := c.BodyParser(&credentials); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "Invalid credentials"})
+	if err := c.BodyParser(&body); err != nil {
+		return c.Status(400).JSON(fiber.Map{"message": "Invalid request body"})
 	}
-	credentials.Email = strings.ToLower(credentials.Email)
-
-	collection := config.GetCollection("users")
-	var user models.User
-	if err := collection.FindOne(context.Background(), bson.M{"email": credentials.Email}).Decode(&user); err != nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"message": "Invalid email or password"})
+	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
+	if body.Email == "" || body.Password == "" {
+		return c.Status(400).JSON(fiber.Map{"message": "Email & password required"})
 	}
 
-	// Call service to compare password
-	if err := services.ComparePassword(user.PasswordHash, credentials.Password); err != nil {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"message": "Invalid email or password"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	users := config.GetCollection("users")
+
+	// email unik
+	if err := users.FindOne(ctx, bson.M{"email": body.Email}).Err(); err == nil {
+		return c.Status(409).JSON(fiber.Map{"message": "Email already registered"})
 	}
 
-	// Call service to generate JWT
-	token, err := services.GenerateJWT(user.ID)
+	hash, err := services.HashPassword(body.Password)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"message": "Could not generate token"})
+		return c.Status(500).JSON(fiber.Map{"message": "Could not hash password"})
 	}
 
-	return c.JSON(fiber.Map{"message": "Login successful", "token": token})
+	user := models.User{
+		ID:            primitive.NewObjectID(),
+		Name:          body.Name,
+		Email:         body.Email,
+		PasswordHash:  hash,
+		Points:        0,
+		BorrowedBooks: []primitive.ObjectID{},
+	}
+	if _, err := users.InsertOne(ctx, user); err != nil {
+		return c.Status(500).JSON(fiber.Map{"message": "Could not register user"})
+	}
+	return c.Status(201).JSON(fiber.Map{"message": "User registered successfully"})
 }
 
-func BorrowBook(c *fiber.Ctx) error {
-	// Ambil data token dari context
-	userToken := c.Locals("user").(*jwt.Token)
-	claims := userToken.Claims.(jwt.MapClaims)
+func LoginUser(c *fiber.Ctx) error {
+	var body struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := c.BodyParser(&body); err != nil {
+		return c.Status(400).JSON(fiber.Map{"message": "Invalid credentials"})
+	}
+	body.Email = strings.ToLower(strings.TrimSpace(body.Email))
 
-	// Dapatkan user ID dari klaim token
-	userID, ok := claims["user_id"].(string)
-	if !ok {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"message": "Invalid token claims"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	users := config.GetCollection("users")
+
+	var user models.User
+	if err := users.FindOne(ctx, bson.M{"email": body.Email}).Decode(&user); err != nil {
+		return c.Status(401).JSON(fiber.Map{"message": "Invalid email or password"})
+	}
+	if err := services.ComparePassword(user.PasswordHash, body.Password); err != nil {
+		return c.Status(401).JSON(fiber.Map{"message": "Invalid email or password"})
 	}
 
-	// Konversi user ID string menjadi ObjectID
-	objID, err := primitive.ObjectIDFromHex(userID)
+	token, err := services.GenerateJWT(user.ID)
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "Invalid user ID in token"})
+		return c.Status(500).JSON(fiber.Map{"message": "Could not generate token"})
+	}
+	return c.JSON(fiber.Map{"token": token})
+}
+
+func GetCurrentUser(c *fiber.Ctx) error {
+	tok := c.Locals("user").(*jwt.Token)
+	claims := tok.Claims.(jwt.MapClaims)
+	idHex, ok := claims["id"].(string)
+	if !ok || idHex == "" {
+		return c.Status(401).JSON(fiber.Map{"message": "Invalid token claims"})
+	}
+	objID, err := primitive.ObjectIDFromHex(idHex)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"message": "Invalid user id"})
 	}
 
-	// Gunakan objID untuk operasi database (misalnya, memperbarui dokumen user)
-	// ...
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	users := config.GetCollection("users")
 
-	return c.SendString("This is a protected route. User ID: " + objID.Hex())
+	var user models.User
+	if err := users.FindOne(ctx, bson.M{"_id": objID}).Decode(&user); err != nil {
+		return c.Status(404).JSON(fiber.Map{"message": "User not found"})
+	}
+	user.PasswordHash = "" // jangan bocorkan hash
+	return c.JSON(user)
 }
